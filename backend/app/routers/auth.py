@@ -1,9 +1,12 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Depends, Form
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
 from typing import Optional
 import jwt
 from passlib.context import CryptContext
-from app.models import UserRegister, UserLogin, Token, User
+from app.models import Token, User
+from app.services.firebase_service import firebase_service
+import os
 
 router = APIRouter(
     prefix="/auth",
@@ -11,14 +14,12 @@ router = APIRouter(
 )
 
 # Security configurations
-SECRET_KEY = "your-secret-key-change-this-in-production"  # TODO: Move to environment variables
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# Temporary in-memory user storage (replace with database later)
-users_db = {}
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
 
 # Helper functions
@@ -46,7 +47,12 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 # Routes
 @router.post("/register", response_model=User, status_code=status.HTTP_201_CREATED)
-async def register(user_data: UserRegister):
+async def register(
+    email: str = Form(..., description="User's email address"),
+    username: str = Form(..., description="Unique username"),
+    password: str = Form(..., description="User's password"),
+    full_name: Optional[str] = Form(None, description="Optional full name")
+):
     """
     Register a new user.
     
@@ -56,62 +62,63 @@ async def register(user_data: UserRegister):
     - **full_name**: Optional full name
     """
     # Check if user already exists
-    if user_data.email in users_db:
+    existing_user = await firebase_service.get_user_by_email(email)
+    if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered"
         )
     
     # Check if username is taken
-    for user in users_db.values():
-        if user["username"] == user_data.username:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Username already taken"
-            )
+    existing_username = await firebase_service.get_user_by_username(username)
+    if existing_username:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already taken"
+        )
     
     # Create new user
-    hashed_password = get_password_hash(user_data.password)
+    hashed_password = get_password_hash(password)
     user_dict = {
-        "email": user_data.email,
-        "username": user_data.username,
-        "full_name": user_data.full_name,
+        "email": email,
+        "username": username,
+        "full_name": full_name,
         "hashed_password": hashed_password,
-        "disabled": False
+        "disabled": False,
+        "created_at": datetime.utcnow().isoformat()
     }
     
-    users_db[user_data.email] = user_dict
+    await firebase_service.create_user(email, user_dict)
     
     return User(
-        email=user_data.email,
-        username=user_data.username,
-        full_name=user_data.full_name,
+        email=email,
+        username=username,
+        full_name=full_name,
         disabled=False
     )
 
 
-@router.post("/login", response_model=Token)
-async def login(user_credentials: UserLogin):
+@router.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     """
-    Login with email and password to receive an access token.
+    OAuth2 compatible token login. Use this with the Authorize button.
     
-    - **email**: User's email address
-    - **password**: User's password
+    - **username**: Your email address
+    - **password**: Your password
     
-    Returns an access token that can be used for authentication.
+    Returns an access token for authentication.
     """
-    # Check if user exists
-    if user_credentials.email not in users_db:
+    # Check if user exists (username is email)
+    user = await firebase_service.get_user_by_email(form_data.username)
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    user = users_db[user_credentials.email]
-    
     # Verify password
-    if not verify_password(user_credentials.password, user["hashed_password"]):
+    if not verify_password(form_data.password, user["hashed_password"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
@@ -128,21 +135,63 @@ async def login(user_credentials: UserLogin):
     # Create access token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user_credentials.email},
+        data={"sub": form_data.username},
         expires_delta=access_token_expires
     )
     
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-@router.get("/me", response_model=User)
-async def get_current_user(token: str):
+@router.post("/login", response_model=Token)
+async def login(
+    email: str = Form(..., description="User's email address"),
+    password: str = Form(..., description="User's password")
+):
     """
-    Get current user information.
+    Alternative login endpoint using form fields.
     
-    - **token**: JWT access token
+    - **email**: User's email address
+    - **password**: User's password
     
-    Returns the current authenticated user's information.
+    Returns an access token that can be used for authentication.
+    """
+    # Check if user exists
+    user = await firebase_service.get_user_by_email(email)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Verify password
+    if not verify_password(password, user["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Check if user is disabled
+    if user.get("disabled", False):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Inactive user"
+        )
+    
+    # Create access token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": email},
+        expires_delta=access_token_expires
+    )
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+async def get_current_user_from_token(token: str = Depends(oauth2_scheme)) -> User:
+    """
+    Dependency to get the current user from the JWT token.
     """
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -150,19 +199,22 @@ async def get_current_user(token: str):
         if email is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Could not validate credentials"
+                detail="Could not validate credentials",
+                headers={"WWW-Authenticate": "Bearer"},
             )
     except jwt.PyJWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials"
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
         )
     
-    user = users_db.get(email)
+    user = await firebase_service.get_user_by_email(email)
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
+            detail="User not found",
+            headers={"WWW-Authenticate": "Bearer"},
         )
     
     return User(
@@ -171,3 +223,13 @@ async def get_current_user(token: str):
         full_name=user.get("full_name"),
         disabled=user.get("disabled", False)
     )
+
+
+@router.get("/get-info", response_model=User)
+async def get_info(current_user: User = Depends(get_current_user_from_token)):
+    """
+    Get current authenticated user information.
+    
+    Requires authentication. Use the Authorize button to add your token.
+    """
+    return current_user

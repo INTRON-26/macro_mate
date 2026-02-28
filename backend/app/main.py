@@ -7,6 +7,10 @@ tags_metadata = [
         "description": "Operations for user authentication including registration and login.",
     },
     {
+        "name": "images",
+        "description": "Image upload operations. Requires a valid Bearer token.",
+    },
+    {
         "name": "default",
         "description": "General application endpoints.",
     },

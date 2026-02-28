@@ -7,10 +7,6 @@ tags_metadata = [
         "description": "Operations for user authentication including registration and login.",
     },
     {
-        "name": "upload",
-        "description": "Image upload operations to Supabase Storage. Requires authentication.",
-    },
-    {
         "name": "default",
         "description": "General application endpoints.",
     },
@@ -24,7 +20,6 @@ MacroMate API helps you track your macros and nutrition. 🥗
 ## Features
 
 * **User Authentication**: Register and login to access personalized features
-* **Image Upload**: Upload and manage images with Supabase Storage
 * **Health Monitoring**: Check API health status
 * **Nutrition Tracking**: Track your daily macros and nutritional intake (coming soon)
 
